@@ -1,0 +1,520 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { MapPin, Navigation } from 'lucide-react';
+import { TripProvider, useTrip } from '@/context/TripContext';
+import { useAuth } from '@/contexts/AuthContext';
+import HeroSection from '@/components/landing/HeroSection';
+import TripInputPanel from '@/components/trip/TripInputPanel';
+import RouteSidebar from '@/components/trip/RouteSidebar';
+import RouteCard from '@/components/trip/RouteCard';
+import CrimeTypeFilter from '@/components/trip/CrimeTypeFilter';
+import MapView from '@/components/trip/MapView';
+import LiveStatusBanner from '@/components/trip/LiveStatusBanner';
+import AlertPopup from '@/components/trip/AlertPopup';
+import SafetyActionsPanel from '@/components/trip/SafetyActionsPanel';
+import TripSummaryComponent from '@/components/trip/TripSummary';
+import ProfileDropdown from '@/components/ProfileDropdown';
+import { Button } from '@/components/ui/button';
+import { ArrowLeft, StopCircle, Loader2, LogIn, Menu } from 'lucide-react';
+import { calculateRoutes } from '@/services/routingService';
+import { toast } from 'sonner';
+import { checkDeviation, DeviationResult } from '@/utils/deviationDetection';
+import { getNearestSafetyZone, haversineDistance } from '@/services/astarRouting';
+import { CrimeType } from '@/utils/crimeTypeMapping';
+const TripApp = () => {
+  const {
+    trip,
+    setRoutes,
+    selectRoute,
+    startMonitoring,
+    updatePosition,
+    addAlert,
+    dismissAlert,
+    resetTrip,
+    tripSummary,
+    completeTip,
+  } = useTrip();
+  
+  const { user, loading: authLoading } = useAuth();
+  const navigate = useNavigate();
+  
+  const [showLanding, setShowLanding] = useState(true);
+  const [isCalculatingRoutes, setIsCalculatingRoutes] = useState(false);
+  const [safetyZones, setSafetyZones] = useState<any[]>([]);
+  const [selectedCrimeTypes, setSelectedCrimeTypes] = useState<CrimeType[]>([]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    if (!authLoading && user) {
+      setShowLanding(false);
+    }
+  }, [authLoading, user]);
+
+  // Toggle crime type filter - for highlighting zones on map
+  const handleToggleCrimeType = useCallback((crimeType: CrimeType) => {
+    setSelectedCrimeTypes(prev => 
+      prev.includes(crimeType) 
+        ? prev.filter(t => t !== crimeType)
+        : [...prev, crimeType]
+    );
+  }, []);
+
+  // Clear all crime type filters
+  const handleClearAllFilters = useCallback(() => {
+    setSelectedCrimeTypes([]);
+  }, []);
+
+
+  // Fetch safety zones for deviation detection
+  useEffect(() => {
+    const fetchSafetyZones = async () => {
+      try {
+        const { supabase } = await import('@/integrations/supabase/client');
+        const { data } = await supabase.from('safety_zones').select('*');
+        if (data) setSafetyZones(data);
+      } catch (error) {
+        console.error('Error fetching safety zones:', error);
+      }
+    };
+    fetchSafetyZones();
+  }, []);
+
+  // Calculate routes using OSRM and safety data
+  const handleFindRoutes = async () => {
+    if (!trip.sourceCoords || !trip.destinationCoords) {
+      toast.error('Please select both source and destination');
+      return;
+    }
+
+    setIsCalculatingRoutes(true);
+    
+    try {
+      const routes = await calculateRoutes(trip.sourceCoords, trip.destinationCoords);
+      
+      if (routes.length === 0) {
+        toast.error('No routes found. Please try different locations.');
+        return;
+      }
+      
+      setRoutes(routes);
+      toast.success(`Found ${routes.length} route${routes.length > 1 ? 's' : ''} with safety analysis`);
+    } catch (error) {
+      console.error('Error calculating routes:', error);
+      toast.error('Failed to calculate routes. Please try again.');
+    } finally {
+      setIsCalculatingRoutes(false);
+    }
+  };
+
+  // Track if GPS toast has been shown
+  const gpsToastShownRef = useRef(false);
+  const watchIdRef = useRef<number | null>(null);
+  const lastDeviationAlertRef = useRef<number>(0);
+  const monitoringStartTimeRef = useRef<number>(0);
+  const monitoringStartPositionRef = useRef<{ lat: number; lng: number } | null>(null);
+  const deviationCooldown = 30000; // 30 seconds between deviation alerts
+  const monitoringGracePeriod = 10000; // 10 second grace period after monitoring starts
+  const minMovementFromStart = 500; // Must move 500m from start before deviation alerts
+
+  // Get initial location on page load
+  useEffect(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          updatePosition({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+          });
+        },
+        (error) => {
+          console.log('Initial location fetch failed:', error.message);
+        },
+        { enableHighAccuracy: true, timeout: 5000 }
+      );
+    }
+  }, []);
+
+  // Real GPS tracking during monitoring with continuous updates
+  useEffect(() => {
+    if (!trip.isMonitoring) {
+      gpsToastShownRef.current = false;
+      monitoringStartPositionRef.current = null;
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      return;
+    }
+
+    // Request location permission and start tracking
+    if (navigator.geolocation) {
+      if (!gpsToastShownRef.current) {
+        toast.success('🔴 Live navigation started - Tracking your location', {
+          duration: 3000,
+        });
+        gpsToastShownRef.current = true;
+        monitoringStartTimeRef.current = Date.now();
+      }
+      
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (position) => {
+          const newPosition = {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+          };
+          updatePosition(newPosition);
+          
+          // Store the first position as the monitoring start position
+          if (!monitoringStartPositionRef.current) {
+            monitoringStartPositionRef.current = newPosition;
+            console.log('[Deviation] Monitoring started at position:', newPosition);
+            return; // Skip first check
+          }
+          
+          // Check for route deviation - but only after grace period
+          const timeSinceStart = Date.now() - monitoringStartTimeRef.current;
+          if (timeSinceStart < monitoringGracePeriod) {
+            // Skip deviation checks during grace period
+            return;
+          }
+          
+          if (trip.selectedRoute && trip.selectedRoute.path.length > 0) {
+            // Check if user has moved enough from where they started monitoring
+            const distanceFromMonitoringStart = haversineDistance(newPosition, monitoringStartPositionRef.current);
+            
+            // Skip alerts if user hasn't moved 500m from where they started
+            if (distanceFromMonitoringStart < minMovementFromStart) {
+              console.log('[Deviation] User has only moved', Math.round(distanceFromMonitoringStart), 'm from start, need 500m');
+              return;
+            }
+            
+            const areaInfo = getNearestSafetyZone(newPosition, safetyZones);
+            const deviation = checkDeviation(newPosition, trip.selectedRoute.path, areaInfo);
+            
+            if (deviation && deviation.isDeviated) {
+              const now = Date.now();
+              // Only alert if cooldown has passed
+              if (now - lastDeviationAlertRef.current > deviationCooldown) {
+                lastDeviationAlertRef.current = now;
+                
+                if (deviation.severity === 'danger') {
+                  addAlert({
+                    type: 'high-risk',
+                    message: deviation.message,
+                  });
+                } else if (deviation.severity === 'warning') {
+                  addAlert({
+                    type: 'deviation',
+                    message: deviation.message,
+                  });
+                }
+              }
+            }
+          }
+        },
+        (error) => {
+          console.error('Geolocation error:', error);
+          if (error.code === error.PERMISSION_DENIED) {
+            toast.error('Location permission denied. Please enable location access.');
+          } else if (error.code === error.POSITION_UNAVAILABLE) {
+            toast.error('Location unavailable. Please check your GPS settings.');
+          } else {
+            toast.error('Unable to get your location.');
+          }
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 0, // Always get fresh position
+        }
+      );
+    } else {
+      toast.error('Geolocation is not supported by your browser.');
+    }
+
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    };
+  }, [trip.isMonitoring]);
+
+  const handleStartMonitoring = () => {
+    if (trip.selectedRoute) {
+      startMonitoring();
+    }
+  };
+
+  // Reroute from current position to destination
+  const handleReroute = async () => {
+    if (!trip.currentPosition || !trip.destinationCoords) {
+      toast.error('Unable to reroute - missing location data');
+      return;
+    }
+
+    toast.loading('Calculating new route from your current location...', { id: 'reroute' });
+    
+    try {
+      const routes = await calculateRoutes(trip.currentPosition, trip.destinationCoords);
+      
+      if (routes.length === 0) {
+        toast.error('No routes found from current location', { id: 'reroute' });
+        return;
+      }
+      
+      // Find the safest route
+      const safestRoute = routes.find(r => r.type === 'safest') || routes[0];
+      
+      // Update routes and auto-select the safest one
+      setRoutes(routes);
+      selectRoute(safestRoute);
+      
+      toast.success(`Rerouted! New ${safestRoute.type} route: ${safestRoute.distance.toFixed(1)} km`, { id: 'reroute' });
+    } catch (error) {
+      console.error('Error rerouting:', error);
+      toast.error('Failed to calculate new route', { id: 'reroute' });
+    }
+  };
+
+  const activeAlert = trip.alerts.find(a => !a.dismissed);
+
+  // Show loading while auth is loading
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  // Show landing page
+  if (showLanding && trip.status === 'idle') {
+    return <HeroSection onStartTrip={() => setShowLanding(false)} />;
+  }
+
+  // Show trip summary
+  if (trip.status === 'completed' && tripSummary) {
+    return (
+      <TripSummaryComponent
+        summary={tripSummary}
+        onNewTrip={resetTrip}
+      />
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-background">
+      <LiveStatusBanner />
+      
+      
+      {/* Header - pushed down when monitoring to avoid overlap with LiveStatusBanner */}
+      <header className={`fixed left-0 right-0 z-30 p-3 sm:p-4 safe-area-top ${trip.isMonitoring ? 'top-[5.5rem] sm:top-[4.5rem]' : 'top-0'}`}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            {/* Hamburger menu for sidebar (visible when routes exist on mobile) */}
+            {trip.routes.length > 0 && !trip.isMonitoring && (
+              <Button
+                variant="glass"
+                size="sm"
+                className="lg:hidden"
+                onClick={() => setSidebarOpen(true)}
+              >
+                <Menu className="w-4 h-4" />
+              </Button>
+            )}
+            
+            <Button
+              variant="glass"
+              size="sm"
+              className="text-xs sm:text-sm"
+              onClick={() => {
+                if (trip.isMonitoring) {
+                  completeTip();
+                } else if (trip.routes.length > 0) {
+                  setRoutes([]);
+                } else {
+                  setShowLanding(true);
+                  resetTrip();
+                }
+              }}
+            >
+              {trip.isMonitoring ? (
+                <>
+                  <StopCircle className="w-4 h-4 sm:mr-2" />
+                  <span className="sm:hidden">End</span>
+                  <span className="hidden sm:inline">End Trip</span>
+                </>
+              ) : (
+                <>
+                  <ArrowLeft className="w-4 h-4 sm:mr-2" />
+                  <span className="hidden sm:inline">Back</span>
+                </>
+              )}
+            </Button>
+          </div>
+          
+          {trip.isMonitoring && (
+            <div className="glass rounded-full px-3 py-1.5 sm:px-4 sm:py-2">
+              <span className="text-xs sm:text-sm text-muted-foreground">
+                <span className="hidden sm:inline">Monitoring: </span>
+                <span className="text-primary font-medium capitalize">{trip.selectedRoute?.type}</span>
+              </span>
+            </div>
+          )}
+
+          {/* Profile Dropdown or Login Button */}
+          <div className="ml-auto">
+            {user ? (
+              <ProfileDropdown />
+            ) : (
+              <Button
+                variant="glass"
+                size="sm"
+                onClick={() => navigate('/auth')}
+                className="text-xs sm:text-sm"
+              >
+                <LogIn className="w-4 h-4 sm:mr-2" />
+                <span className="hidden sm:inline">Sign In</span>
+              </Button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <div className="min-h-screen pt-16 sm:pt-20 pb-24 sm:pb-6 px-3 sm:px-4">
+        {/* Source/Destination display - always above the map, full width */}
+        {(trip.source || trip.destination) && trip.routes.length > 0 && !trip.isMonitoring && (
+          <div className="glass-strong rounded-xl px-3 py-2 space-y-1 mb-4">
+            <div className="flex items-center gap-2">
+              <MapPin className="w-3.5 h-3.5 text-safe shrink-0" />
+              <span className="text-xs font-medium text-foreground truncate">
+                {trip.source || 'Source'}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <MapPin className="w-3.5 h-3.5 text-destructive shrink-0" />
+              <span className="text-xs font-medium text-foreground truncate">
+                {trip.destination || 'Destination'}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Main layout: sidebar + map */}
+        <div className="flex flex-col lg:flex-row gap-4 sm:gap-6">
+          {/* Trip Input - Above map on mobile, in sidebar area on desktop */}
+          <div className="w-full lg:w-96 flex-shrink-0 order-1 lg:order-1">
+            {(trip.status === 'idle' || (trip.status === 'planning' && trip.routes.length === 0)) && (
+              <TripInputPanel onFindRoutes={handleFindRoutes} isLoading={isCalculatingRoutes} />
+            )}
+
+            {/* Desktop only: show filters & routes inline */}
+            {trip.routes.length > 0 && !trip.isMonitoring && (
+              <div className="hidden lg:block mt-4 space-y-4">
+                <CrimeTypeFilter
+                  selectedCrimeTypes={selectedCrimeTypes}
+                  onToggle={handleToggleCrimeType}
+                  onClearAll={handleClearAllFilters}
+                />
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between px-1">
+                    <h2 className="text-lg font-semibold text-foreground">Available Routes</h2>
+                  </div>
+                  {trip.routes.map((route) => (
+                    <RouteCard
+                      key={route.id}
+                      route={route}
+                      isSelected={trip.selectedRoute?.id === route.id}
+                      onSelect={() => selectRoute(route)}
+                      onStartMonitoring={handleStartMonitoring}
+                      safetyZones={safetyZones}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Selected Route Info During Monitoring - Desktop only */}
+            {trip.isMonitoring && trip.selectedRoute && (
+              <div className="hidden sm:block glass-strong rounded-2xl p-4 sm:p-6 animate-slide-up mt-4">
+                <h3 className="font-semibold text-foreground mb-3 sm:mb-4">Active Route</h3>
+                <div className="glass rounded-xl p-3 sm:p-5 border-2 border-transparent">
+                  <div className="flex items-start justify-between mb-3 gap-2">
+                    <div>
+                      <h3 className="font-semibold text-foreground text-sm sm:text-base capitalize">
+                        {trip.selectedRoute.type === 'fastest' ? '🟦' : trip.selectedRoute.type === 'safest' ? '🟩' : '🟨'} {trip.selectedRoute.type} Route
+                      </h3>
+                      <p className="text-xs sm:text-sm text-muted-foreground capitalize">{trip.selectedRoute.type} option</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div><p className="text-xs font-medium text-foreground">{trip.selectedRoute.distance} km</p><p className="text-[10px] text-muted-foreground">Distance</p></div>
+                    <div><p className="text-xs font-medium text-foreground">{trip.selectedRoute.duration} min</p><p className="text-[10px] text-muted-foreground">Duration</p></div>
+                    <div><p className="text-xs font-medium text-foreground">{trip.selectedRoute.safetyScore}/100</p><p className="text-[10px] text-muted-foreground">Safety</p></div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Map - Full width, below trip input on mobile */}
+          <div className="flex-1 min-h-[50vh] sm:min-h-[400px] lg:min-h-0 lg:h-auto lg:self-stretch order-2 lg:order-2 lg:sticky lg:top-20" style={{ minHeight: 'calc(100vh - 6rem)' }}>
+            <MapView 
+              routes={trip.routes} 
+              sourceCoords={trip.sourceCoords}
+              destinationCoords={trip.destinationCoords}
+              selectedRoute={trip.selectedRoute}
+              currentPosition={trip.currentPosition}
+              isMonitoring={trip.isMonitoring}
+              sourceName={trip.source}
+              destinationName={trip.destination}
+              highlightedCrimeTypes={selectedCrimeTypes}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile: Slide-out sidebar for routes & crime zones */}
+      <div className="lg:hidden">
+        <RouteSidebar
+          routes={trip.routes}
+          selectedRoute={trip.selectedRoute}
+          isMonitoring={trip.isMonitoring}
+          selectedCrimeTypes={selectedCrimeTypes}
+          safetyZones={safetyZones}
+          onToggleCrimeType={handleToggleCrimeType}
+          onClearAllFilters={handleClearAllFilters}
+          onSelectRoute={(route) => selectRoute(route)}
+          onStartMonitoring={handleStartMonitoring}
+          externalOpen={sidebarOpen}
+          onExternalOpenChange={setSidebarOpen}
+        />
+      </div>
+
+      {/* Safety Actions Panel */}
+      <SafetyActionsPanel />
+
+      {/* Alert Popup */}
+      {activeAlert && (
+        <AlertPopup
+          alert={activeAlert}
+          onDismiss={() => dismissAlert(activeAlert.id)}
+          onReroute={() => {
+            dismissAlert(activeAlert.id);
+            handleReroute();
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+const Index = () => (
+  <TripProvider>
+    <TripApp />
+  </TripProvider>
+);
+
+export default Index;

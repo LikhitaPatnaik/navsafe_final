@@ -882,3 +882,6 @@ const MapView = ({ routes = [], sourceCoords, destinationCoords, selectedRoute, 
 };
 
 export default MapView;
+
+
+//mapView.tsx

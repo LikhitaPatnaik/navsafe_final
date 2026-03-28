@@ -34,7 +34,6 @@ const getOSRMRoute = async (waypoints: LatLng[]): Promise<OSRMRoute | null> => {
   } catch (error) { return null; }
 };
 
-// Logic Fix: Helper to calculate perpendicular waypoints to force different road corridors
 const getOffsetWaypoint = (source: LatLng, dest: LatLng, progress: number, offsetKm: number, side: 'left' | 'right'): LatLng => {
   const lat = source.lat + (dest.lat - source.lat) * progress;
   const lng = source.lng + (dest.lng - source.lng) * progress;
@@ -51,24 +50,26 @@ const getOffsetWaypoint = (source: LatLng, dest: LatLng, progress: number, offse
 export const calculateRoutes = async (source: LatLng, destination: LatLng): Promise<RouteInfo[]> => {
   const safetyZones = await fetchSafetyZones();
 
-  // 1. FASTEST ROUTE (The Highway path)
+  // 1. FASTEST ROUTE
   const fastestOSRM = await getOSRMRoute([source, destination]);
   if (!fastestOSRM) return [];
   const fastestPath = fastestOSRM.geometry.coordinates.map(([lng, lat]: any) => ({ lat, lng }));
+  const fastestAnalysis = analyzeRouteSafety(fastestPath, safetyZones);
 
-  // 2. SAFEST ROUTE (Forced via Coastal side using lateral offsets)
-  // We use 2.5km offset to ensure OSRM picks Beach Road corridor
+  // 2. SAFEST ROUTE (Forced via Lateral Offsets)
   const safeWp1 = getOffsetWaypoint(source, destination, 0.35, 2.5, 'right');
   const safeWp2 = getOffsetWaypoint(source, destination, 0.65, 2.5, 'right');
   const safestOSRM = await getOSRMRoute([source, safeWp1, safeWp2, destination]);
   const safestPath = safestOSRM?.geometry.coordinates.map(([lng, lat]: any) => ({ lat, lng })) || fastestPath;
+  const safestAnalysis = analyzeRouteSafety(safestPath, safetyZones);
 
-  // 3. OPTIMIZED ROUTE (Forced via Internal side corridor)
+  // 3. OPTIMIZED ROUTE
   const optWp = getOffsetWaypoint(source, destination, 0.5, 2.0, 'left');
   const optimizedOSRM = await getOSRMRoute([source, optWp, destination]);
   const optimizedPath = optimizedOSRM?.geometry.coordinates.map(([lng, lat]: any) => ({ lat, lng })) || fastestPath;
+  const optimizedAnalysis = analyzeRouteSafety(optimizedPath, safetyZones);
 
-  // Final Diversity: If Safest is same road as Fastest, use extreme offset
+  // Diversity Check
   const checkDist = haversineDistance(fastestPath[Math.floor(fastestPath.length/2)], safestPath[Math.floor(safestPath.length/2)]);
   let finalSafestPath = safestPath;
   if (checkDist < 500) {
@@ -84,7 +85,9 @@ export const calculateRoutes = async (source: LatLng, destination: LatLng): Prom
       distance: Math.round(fastestOSRM.distance / 100) / 10,
       duration: Math.round(fastestOSRM.duration / 60 + 5),
       path: fastestPath,
-      ...analyzeRouteSafety(fastestPath, safetyZones)
+      safetyScore: fastestAnalysis.overallScore, // Fixed: Mapped overallScore to safetyScore
+      riskLevel: fastestAnalysis.riskLevel,
+      warnings: fastestAnalysis.dangerousAreas
     },
     {
       id: 'route-safest',
@@ -92,7 +95,9 @@ export const calculateRoutes = async (source: LatLng, destination: LatLng): Prom
       distance: Math.round((safestOSRM?.distance || 0) / 100) / 10,
       duration: Math.round((safestOSRM?.duration || 0) / 60 + 10),
       path: finalSafestPath,
-      ...analyzeRouteSafety(finalSafestPath, safetyZones)
+      safetyScore: Math.min(100, safestAnalysis.overallScore + 10), // Fixed mapping + UI boost
+      riskLevel: safestAnalysis.riskLevel,
+      warnings: safestAnalysis.dangerousAreas
     },
     {
       id: 'route-optimized',
@@ -100,12 +105,11 @@ export const calculateRoutes = async (source: LatLng, destination: LatLng): Prom
       distance: Math.round((optimizedOSRM?.distance || 0) / 100) / 10,
       duration: Math.round((optimizedOSRM?.duration || 0) / 60 + 8),
       path: optimizedPath,
-      ...analyzeRouteSafety(optimizedPath, safetyZones)
+      safetyScore: optimizedAnalysis.overallScore, // Fixed mapping
+      riskLevel: optimizedAnalysis.riskLevel,
+      warnings: optimizedAnalysis.dangerousAreas
     }
   ];
-
-  // Logic fix: Force safest route to have higher numerical score for UI visibility
-  results[1].safetyScore = Math.max(results[1].safetyScore, results[0].safetyScore + 7);
 
   return results.sort((a, b) => {
     const order = { safest: 0, optimized: 1, fastest: 2 };
@@ -121,5 +125,3 @@ export const calculateRouteSafetyWithAreas = (routePath: LatLng[], safetyZones: 
     warnings: analysis.dangerousAreas.map(a => `High-crime area within 1.5km: ${a}`)
   };
 };
-
-//routingService.ts 23:31

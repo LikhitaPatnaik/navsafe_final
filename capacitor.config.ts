@@ -6,7 +6,7 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     // REPLACE THIS URL WITH YOUR ACTUAL VERCEL URL
-    url: 'navsafe-final-ynff.vercel.app', 
+    url: 'https://navsafe-final-ynff.vercel.app', 
     cleartext: true
   }
 };

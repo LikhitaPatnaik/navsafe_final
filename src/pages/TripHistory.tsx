@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/contexts/AuthContext';
-import { supabase } from '@/integrations/supabase/client';
-import { Button } from '@/components/ui/button';
+import { useAuth } from '../contexts/AuthContext';
+import { supabase } from '@/integrations/supabase/client.ts';
+import { Button } from '@/components/ui/button.tsx';
 import { ArrowLeft, MapPin, Clock, Shield, AlertTriangle, Navigation, Trash2, Loader2, History } from 'lucide-react';
 import { toast } from 'sonner';
-import ProfileDropdown from '@/components/ProfileDropdown';
+import ProfileDropdown from '@/components/ProfileDropdown.tsx';
 
 interface TripRecord {
   id: string;

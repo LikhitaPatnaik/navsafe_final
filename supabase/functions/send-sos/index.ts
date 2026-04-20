@@ -29,7 +29,7 @@ const sendTwilioMessage = async (
   const accountSid = Deno.env.get('TWILIO_ACCOUNT_SID');
   const authToken = Deno.env.get('TWILIO_AUTH_TOKEN');
   const fromNumber = Deno.env.get('TWILIO_PHONE_NUMBER');
-  const whatsappSandbox = 'whatsapp:+14155238886';
+  const whatsappSandbox = 'whatsapp:+1 825 782 9674';
 
   if (!accountSid || !authToken || !fromNumber) {
     return { success: false, error: 'Missing Twilio credentials', channel };
